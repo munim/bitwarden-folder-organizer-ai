@@ -1,5 +1,5 @@
 [project]
-name = "organize-bitwarden-folders-ai"
+name = "bitwarden-folder-organizer-ai"
 version = "0.1.0"
 description = "Organize Bitwarden folders/collections using bw CLI + LLM (never sends secrets)."
 readme = "README.md"

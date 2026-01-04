@@ -1,4 +1,4 @@
-# organize-bitwarden-folders-ai
+# Bitwarden Folder Organizer using AI
 
 Organize your Bitwarden vault into meaningful folders/collections using an LLM — **powered by the Bitwarden CLI (`bw`)**.
 
@@ -72,8 +72,8 @@ This project uses the following rules:
 ## Installation
 
 ```bash
-git clone https://github.com/munim/organize-bitwarden-folders-ai.git
-cd organize-bitwarden-folders-ai
+git clone https://github.com/munim/bitwarden-folder-organizer-ai.git
+cd bitwarden-folder-organizer-ai
 
 # Install dependencies
 uv sync
@@ -82,7 +82,7 @@ uv sync
 ## Bitwarden CLI setup
 
 ### 1) Install `bw`
-Follow Bitwarden’s official CLI docs or use your preferred package manager.
+Follow Bitwarden’s official CLI installation docs: https://bitwarden.com/help/cli/
 
 ### 2) Login and unlock
 This tool requires an unlocked vault session.
