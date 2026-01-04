@@ -1,191 +1,335 @@
-<!-- filepath: /playground/organize-bitwarden-folders-ai/README.md -->
-# Bitwarden Vault Categorizer
+# organize-bitwarden-folders-ai
 
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Organize your Bitwarden vault into meaningful folders/collections using an LLM — **powered by the Bitwarden CLI (`bw`)**.
 
-A command-line tool to automatically categorize your Bitwarden vault items using the OpenRouter LLM API. It processes a Bitwarden JSON export and assigns categories to each item, saving results to CSV.
+This project reads your vault directly via `bw`, sends only **non-sensitive metadata** to an LLM in batches, and then moves items:
 
----
+- **Personal vault items** → moved by updating `folderId` (folders)
+- **Organization items** → moved by replacing collection assignments (collections)
+
+## Why this exists
+Bitwarden is great at storing credentials, but it’s easy for vaults to become messy over time. This tool automates vault organization while keeping an explicit, strict privacy boundary: the LLM never receives secrets.
 
 ## Features
-- Categorizes Bitwarden items using LLMs (OpenRouter API)
-- Supports batch processing for efficiency
-- Auto-categorizes company items by folder or email domain (no API cost)
-- Outputs a detailed CSV with categories, confidence, and reasons
-- CLI with flexible arguments and model selection
-- If a domain in the item's URL is not reachable, the item will be moved to a special
-  "Dead" folder. (A domain is considered unreachable if it does not resolve or respond
-  to network requests during processing.)
-- If the item's URL contains an IP address and it is a private IP (e.g., 10.x.x.x,
-  192.168.x.x, 172.16.x.x–172.31.x.x), the item will be moved to the
-  "Personal/Homelab" folder. This helps separate internal or homelab credentials from
-  public-facing ones.
+- **End-to-end `bw` workflow**
+  - List items/folders from the vault via `bw`
+  - Create missing folders/collections via `bw`
+  - Move items via `bw edit ...`
+- **Batch LLM categorization** (OpenRouter or Requesty)
+- **Domain cache** to reduce repeated LLM calls
+- **Domain-to-folder mapping** (YAML) to auto-categorize without LLM cost
+- **Homelab detection**
+  - If an item URL points to a private IP (or resolves to one), it is categorized as `Homelab`
+- **Optional “Dead” detection** (`--check-reachability`)
+  - If an item has URLs and none are reachable, it is categorized as `Dead`
+- **Safe-by-default execution**
+  - Dry-run is the default; `--apply` is required to change your vault
 
----
+## Security & Privacy Model (read this)
+This tool enforces a hard boundary around what is sent to the LLM.
 
-## Table of Contents
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Export Bitwarden Vault](#export-bitwarden-vault)
-- [Usage](#usage)
-- [Input Format](#input-format)
-- [Output Format](#output-format)
-- [Categories](#categories)
-- [Tips](#tips-for-best-results)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
+### Never sent to LLM
+- Passwords
+- Notes
+- TOTP
+- Custom field values (only field names may be sent)
+- Card/identity contents
 
----
+### Allowed LLM fields
+For each vault item, your LLM prompt may include only:
+- `id`
+- `name`
+- `type`
+- Current folder name (name only)
+- Login URIs (`login.uris[].uri`) (URLs only)
+- Username (masked if it looks like an email: `***@domain.com`)
+- Custom field names (names only)
+
+The code includes a runtime guard that refuses to send prompts containing forbidden keys like `"password"`, `"notes"`, `"totp"`, or custom field `"value"`.
+
+## How categorization maps to folders/collections
+The LLM returns categories that may look like `Tools/Development`.
+
+This project uses the following rules:
+- `Personal/Homelab` → `Homelab`
+- `Dead` → `Dead`
+- Everything else → **top-level** segment only
+  - `Tools/Development` → `Tools`
+  - `Financial/Banking` → `Financial`
+
+### Personal vs Organization items
+- Personal items are moved by setting `folderId`.
+- Organization items are moved by **replacing** the item’s existing collection assignments with a single collection matching the category label, **inside the same organization** the item already belongs to.
 
 ## Prerequisites
-- Python 3.8 or higher
-- pip
+- Python **3.11+**
+- [`uv`](https://github.com/astral-sh/uv) (recommended)
+- Bitwarden CLI (`bw`)
+- An API key for your chosen LLM provider:
+  - `OPENROUTER_API_KEY` for OpenRouter
+  - `REQUESTY_API_KEY` for Requesty
 
 ## Installation
 
 ```bash
-# Clone the repository
-$ git clone https://github.com/yourusername/organize-bitwarden-folders-ai.git
-$ cd organize-bitwarden-folders-ai
+git clone https://github.com/munim/organize-bitwarden-folders-ai.git
+cd organize-bitwarden-folders-ai
 
 # Install dependencies
-$ pip install python-dotenv requests pyyaml
+uv sync
 ```
+
+## Bitwarden CLI setup
+
+### 1) Install `bw`
+Follow Bitwarden’s official CLI docs or use your preferred package manager.
+
+### 2) Login and unlock
+This tool requires an unlocked vault session.
+
+```bash
+bw login
+export BW_SESSION="$(bw unlock --raw)"
+```
+
+Confirm status:
+
+```bash
+bw status
+```
+
+It should show `"status": "unlocked"`.
+
+### Session security
+A `BW_SESSION` token grants full access to your vault while valid. Treat it like a password.
 
 ## Configuration
 
-1. Create a `.env` file in the project directory
-2. Add your OpenRouter API key:
-   ```env
-   OPENROUTER_API_KEY=your_openrouter_api_key_here
-   ```
-   - **Never commit your API key to version control!**
+### LLM provider API keys
+Create a `.env` file (or export environment variables) like:
 
-## Export Bitwarden Vault
-
-1. Open your Bitwarden vault
-2. Go to "Tools" > "Export Vault"
-3. Choose **JSON** format
-4. Save the file (e.g., `input.json`)
-
-## Usage
-
-```bash
-python bitwarden_categorizer.py -i input.json -o output.csv -m claude-3-haiku-20240307 -b 10
+```env
+OPENROUTER_API_KEY=your_key_here
+# or
+REQUESTY_API_KEY=your_key_here
 ```
 
-### Command-line Arguments
-- `-i, --input`      Input Bitwarden export JSON file (**required**)
-- `-o, --output`     Output CSV file for categorized data (**required**)
-- `-m, --model`      OpenRouter model (default: `claude-3-haiku-20240307`)
-- `-b, --batch-size` Number of items per LLM request (default: `10`)
-- `--domain-folder-map` YAML file for domain-to-folder mapping (optional)
+Never commit `.env` to version control.
 
-Run `python bitwarden_categorizer.py --help` for full options.
+### Optional domain-to-folder mapping
+You can auto-categorize certain items without sending them to the LLM.
 
-## Input Format
+Create a YAML file such as `domain_folder_map.yaml`:
 
-The input file must be a Bitwarden JSON export with at least these top-level keys:
-- `folders`: Array of folder objects (`id`, `name`)
-- `items`: Array of item objects (`id`, `name`, `type`, `folderId`, `login` with `uris` and `username`)
-
-Example:
-```json
-{
-  "folders": [
-    { "id": "94de53f7-7698-4f11-904a-b27f00a3ed49", "name": "AI" }
-  ],
-  "items": [
-    {
-      "id": "51e7100b-0c56-44ac-afd5-ace000215975",
-      "folderId": "94de53f7-7698-4f11-904a-b27f00a3ed49",
-      "type": 1,
-      "name": "x.ai",
-      "login": {
-        "uris": [ { "uri": "https://www.x.ai" } ],
-        "username": "munim"
-      }
-    }
-  ]
-}
-```
-
-## Output Format
-
-The output CSV will include:
-- `id`: Bitwarden item ID
-- `name`: Item title
-- `category`: Assigned category
-- `confidence`: Confidence score (0-100)
-- `reason`: Brief explanation for the category
-- All original Bitwarden fields (folder, favorite, type, notes, fields, reprompt, login_uri, login_username, login_password, login_totp)
-
-## Categories
-
-### Regular Categories
-- Financial (Banking, Credit Cards, Payment Services)
-- Social Media
-- Email Services
-- Work Tools
-- Shopping
-- Entertainment
-- Government/Legal
-- Utilities
-- Education
-- Healthcare
-- Gaming
-- Travel
-- Cloud Services
-- Developer Tools
-- Personal Projects
-- Communication
-- Security
-- AI
-
-### Domain-to-Folder Mapping (Optional)
-
-You can provide a YAML file to map email domains to folder names for auto-categorization. Use the `--domain-folder-map` argument:
-
-```bash
-python bitwarden_categorizer.py -i input.json -o output.csv --domain-folder-map domain_folder_map.yaml
-```
-
-Example `domain_folder_map.yaml`:
 ```yaml
 - domain: google.com
   folder: "Google"
-- domain: facebook.com
-  folder: "Facebook"
+- domain: example.org
+  folder: "Work"
 ```
 
-If provided, items are auto-categorized (not sent to LLM) if:
-- Folder name matches any folder in the YAML file
-- Email domain in username matches any domain in the YAML file
+Rules:
+- If an item is already in a folder matching one of the mapped folders → it is categorized immediately
+- If a username contains a mapped domain → it is categorized immediately
 
-**Note:** Items matched by the domain-to-folder map are not sent to the LLM to save API costs and ensure consistent naming.
+## Usage
 
-## Tips for Best Results
+### Quick start (dry-run)
+Dry-run is the default. It prints planned moves without modifying your vault.
 
-1. Use a cost-effective model like `claude-3-haiku-20240307` for balance
-2. For higher accuracy, try `claude-3-5-sonnet-20240620` (higher cost)
-3. Keep batch sizes reasonable (10-20) to avoid token limits
-4. Ensure your JSON export is clean and properly structured
-5. For large vaults (2000+ items), allow extra time due to API rate limits
+```bash
+uv run python main.py --dry-run
+```
+
+### Apply changes
+Actually moves items, creating missing folders/collections as needed:
+
+```bash
+uv run python main.py --apply
+```
+
+## Examples
+
+### 1) Safest first run (single batch)
+Limits work while you verify categorization quality:
+
+```bash
+uv run python main.py --dry-run --max-batches 1
+```
+
+### 2) Use a specific model
+
+```bash
+uv run python main.py --dry-run --model claude-3-haiku-20240307
+```
+
+### 3) Switch LLM provider
+
+```bash
+uv run python main.py --dry-run --provider requesty
+```
+
+### 4) Tune batching and pacing
+Helpful if you hit throttling or want to reduce load:
+
+```bash
+uv run python main.py --apply --batch-size 10 --sleep-between-batches 5 --item-delay 0.2
+```
+
+### 5) Enable reachability checks (“Dead”)
+This feature is **off by default**.
+
+```bash
+uv run python main.py --dry-run --check-reachability
+```
+
+### 6) Use a domain-to-folder map (auto-categorize without LLM)
+
+```bash
+uv run python main.py --dry-run --domain-folder-map domain_folder_map.yaml
+```
+
+### 7) Process only items matching a search query
+
+```bash
+uv run python main.py --dry-run --search github
+```
+
+### 8) Process only items in a specific folder
+
+```bash
+uv run python main.py --dry-run --folderid <folder-id>
+```
+
+Tip (find folder ids):
+
+```bash
+bw list folders
+```
+
+### 9) Process only items in a specific organization
+
+```bash
+uv run python main.py --dry-run --organizationid <org-id>
+```
+
+Tip (find organization ids):
+
+```bash
+bw list organizations
+```
+
+### 10) Process only items in a specific collection
+
+```bash
+uv run python main.py --dry-run --collectionid <collection-id>
+```
+
+Tip (find collection ids for an org):
+
+```bash
+bw list org-collections --organizationid <org-id>
+```
+
+### 11) Include trashed items
+
+```bash
+uv run python main.py --dry-run --trash
+```
+
+### 12) Sync before reading
+Useful if you make changes in the Bitwarden UI and want the latest state:
+
+```bash
+uv run python main.py --dry-run --sync
+```
+
+### 13) Pass session explicitly (instead of `BW_SESSION`)
+
+```bash
+uv run python main.py --dry-run --session "<your-bw-session>"
+```
+
+## CLI Reference
+
+Run this for the authoritative list:
+
+```bash
+uv run python main.py --help
+```
+
+### LLM options
+- `--provider {openrouter,requesty}`: LLM provider backend (default: `openrouter`).
+- `--model <model>`: LLM model name (default: `claude-3-haiku-20240307`).
+- `--batch-size, -b <N>`: Items per LLM request batch (default: `10`).
+- `--max-batches <N>`: Limit to the first N batches (useful for testing).
+- `--domain-folder-map <path>`: YAML mapping for auto-categorization.
+
+### Classification toggles
+- `--check-reachability`: If set, categorize logins with unreachable URLs as `Dead`.
+
+### Bitwarden access
+- `--session <token>`: Bitwarden session token (otherwise uses `BW_SESSION`).
+- `--sync`: Run `bw sync` before listing items.
+
+### Item filters
+These flags are passed through to `bw list items` to reduce the scope.
+
+- `--search <text>`: Bitwarden search query.
+- `--folderid <id>`: Filter by folder id (`null` is accepted by `bw`).
+- `--collectionid <id>`: Filter by collection id.
+- `--organizationid <id>`: Filter by organization id.
+- `--trash`: Include items in the trash.
+
+### Execution
+- `--dry-run`: Print planned changes without modifying the vault (default unless `--apply`).
+- `--apply`: Apply changes to the vault.
+- `--sleep-between-batches <seconds>`: Delay between LLM requests (default: `5`).
+- `--item-delay <seconds>`: Delay between each `bw edit` mutation (default: `0.2`).
 
 ## Troubleshooting
 
-- **API Key Issues:** Check your `.env` file and key format
-- **JSON Format Issues:** Ensure your export matches the expected structure
-- **Rate Limiting:** Lower batch size or add delays between batches
-- **Model Selection:** Try a more advanced model if results are poor
+### Vault locked / session missing
+If you see an error about the vault not being unlocked:
+
+```bash
+bw login
+export BW_SESSION="$(bw unlock --raw)"
+```
+
+Then rerun.
+
+### Missing API key
+- OpenRouter requires `OPENROUTER_API_KEY`
+- Requesty requires `REQUESTY_API_KEY`
+
+### Too slow / rate limiting
+- Reduce `--batch-size`
+- Increase `--sleep-between-batches`
+- Increase `--item-delay`
+
+### Folder/collection creation errors
+If Bitwarden refuses creation, check:
+- you are unlocked
+- you have permissions in the organization (for org collections)
+
+## Development
+
+### Project layout
+- `main.py`: CLI entrypoint and orchestration
+- `classify_bitwarden_vault_items.py`: categorization library + `bw` integration + LLM safety guardrails
+
+### Quick checks
+
+```bash
+python -m py_compile main.py classify_bitwarden_vault_items.py
+```
 
 ## Contributing
+PRs are welcome.
 
-Contributions, bug reports, and feature requests are welcome! Please open an issue or pull request.
+- Keep security boundaries intact: never add secrets to LLM payloads.
+- Prefer small, reviewable changes.
 
 ## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT (see `LICENSE`).
