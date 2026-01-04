@@ -13,18 +13,15 @@ import argparse
 import os
 import sys
 import time
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from collections import Counter
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Set
 
 from classify_bitwarden_vault_items import (
     BwItemSafe,
     bw,
     bw_create_folder,
-    bw_create_org_collection,
     bw_list_folders,
     bw_list_items,
-    bw_list_org_collections,
-    bw_set_item_collections_replace,
     bw_set_item_folder,
     bw_status,
     category_to_label,
@@ -36,6 +33,42 @@ from classify_bitwarden_vault_items import (
 
 # Bitwarden item type codes vary by version; secure notes are commonly type=2.
 SECURE_NOTE_TYPE = 2
+
+
+def progress(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def truncate_name(text: str, limit: int = 60) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3] + "..."
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - minutes * 60
+    return f"{minutes}m{int(rem):02d}s"
+
+
+def estimate_eta(start_time: float, done: int, total: int) -> str:
+    if done <= 0:
+        return "unknown"
+    elapsed = time.time() - start_time
+    avg = elapsed / done
+    remaining = max(0, total - done)
+    return format_duration(avg * remaining)
+
+
+def shorten_id(value: str, length: int = 8) -> str:
+    s = str(value or "")
+    return s[:length] if s else s
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -119,12 +152,8 @@ def is_org_item(item: Mapping[str, Any]) -> bool:
 def item_current_location(
     item: Mapping[str, Any], folder_id_to_name: Mapping[str, str]
 ) -> str:
-    if is_org_item(item):
-        return f"org:{item.get('organizationId')}"
-    folder_id = item.get("folderId")
-    if isinstance(folder_id, str) and folder_id:
-        return folder_id_to_name.get(folder_id, "")
-    return ""
+    # Kept for compatibility; now simply returns current folder name.
+    return current_folder_name(item, folder_id_to_name)
 
 
 def safe_items_from_bw_items(
@@ -150,41 +179,24 @@ def safe_items_from_bw_items(
 
 def ensure_folder(
     label: str, name_to_id: Dict[str, str], session: Optional[str]
-) -> str:
+) -> Tuple[str, bool]:
     if label in name_to_id:
-        return name_to_id[label]
+        return name_to_id[label], False
     created = bw_create_folder(label, session=session)
     folder_id = str(created.get("id") or "")
     if not folder_id:
         raise RuntimeError(f"Failed to create folder: {label}")
     name_to_id[label] = folder_id
-    return folder_id
+    return folder_id, True
 
 
-def ensure_org_collection(
-    org_id: str,
-    label: str,
-    org_collection_maps: Dict[str, Dict[str, str]],
-    session: Optional[str],
+def current_folder_name(
+    item: Mapping[str, Any], folder_id_to_name: Mapping[str, str]
 ) -> str:
-    if org_id not in org_collection_maps:
-        collections = bw_list_org_collections(org_id, session=session)
-        org_collection_maps[org_id] = {
-            str(c.get("name")): str(c.get("id"))
-            for c in collections
-            if isinstance(c.get("name"), str) and isinstance(c.get("id"), str)
-        }
-
-    name_to_id = org_collection_maps[org_id]
-    if label in name_to_id:
-        return name_to_id[label]
-
-    created = bw_create_org_collection(org_id, label, session=session)
-    cid = str(created.get("id") or "")
-    if not cid:
-        raise RuntimeError(f"Failed to create org collection: {org_id} {label}")
-    name_to_id[label] = cid
-    return cid
+    folder_id = item.get("folderId")
+    if isinstance(folder_id, str) and folder_id.strip() != "":
+        return folder_id_to_name.get(folder_id, "")
+    return ""
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -235,7 +247,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     all_results: List[Dict[str, Any]] = []
     max_batches = args.max_batches if args.max_batches is not None else len(batches)
 
+    classify_start = time.time()
+    source_counts: Counter[str] = Counter()
+    label_counts_running: Counter[str] = Counter()
+
     for idx, batch in enumerate(batches[:max_batches]):
+        total = len(safe_items)
+        done_before = len(all_results)
+        remaining = max(0, total - done_before)
+
+        progress(
+            f"[batch {idx + 1}/{max_batches}] start | batch_size={len(batch)} | "
+            f"done={done_before}/{total} | remaining={remaining}"
+        )
+
+        batch_start = time.time()
         results = categorize_batch(
             batch,
             model=args.model,
@@ -245,9 +271,37 @@ def main(argv: Optional[List[str]] = None) -> int:
             folder_set=folder_set,
             check_reachability=args.check_reachability,
         )
+        batch_time = time.time() - batch_start
+
         all_results.extend(results)
 
+        for res in results:
+            source_counts[str(res.get("source") or "unknown")] += 1
+            category = str(res.get("category") or "")
+            if category:
+                label_counts_running[category_to_label(category)] += 1
+
+        top_labels = ", ".join(
+            f"{label}={count}" for label, count in label_counts_running.most_common(5)
+        )
+        sources = " ".join(
+            f"{k}={v}" for k, v in source_counts.most_common() if k != "unknown"
+        )
+
+        done_after = len(all_results)
+        progress(
+            f"[batch {idx + 1}/{max_batches}] done in {format_duration(batch_time)} | "
+            f"done={done_after}/{total} | eta {estimate_eta(classify_start, done_after, total)}"
+        )
+        if sources:
+            progress(f"  sources: {sources}")
+        if top_labels:
+            progress(f"  labels(top5): {top_labels}")
+
         if idx < max_batches - 1:
+            progress(
+                f"[batch {idx + 1}/{max_batches}] sleeping {args.sleep_between_batches:.1f}s"
+            )
             time.sleep(args.sleep_between_batches)
 
     # Build plan
@@ -256,7 +310,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
 
     planned_personal: Dict[str, str] = {}
-    planned_org: Dict[str, Tuple[str, str]] = {}  # item_id -> (org_id, label)
+    planned_org_folders: Dict[str, str] = {}
+
+    skipped_already_correct = 0
 
     for res in all_results:
         item_id = str(res.get("id") or "")
@@ -274,18 +330,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not item:
             continue
 
+        current_label = current_folder_name(item, folder_id_to_name)
+        if current_label == label:
+            skipped_already_correct += 1
+            continue
+
         if is_org_item(item):
-            planned_org[item_id] = (str(item.get("organizationId")), label)
+            planned_org_folders[item_id] = label
         else:
             planned_personal[item_id] = label
 
     # Dry-run
     label_counts = Counter(planned_personal.values())
-    label_counts.update([lbl for _, lbl in planned_org.values()])
+    label_counts.update(planned_org_folders.values())
 
     print(f"Scanned: {len(bw_items)} items")
     print(f"Skipped secure notes: {skipped}")
-    print(f"Planned moves: {len(planned_personal) + len(planned_org)}")
+    print(f"Skipped already-correct: {skipped_already_correct}")
+    print(f"Planned moves: {len(planned_personal) + len(planned_org_folders)}")
     if label_counts:
         print("Planned by label:")
         for label, count in label_counts.most_common():
@@ -296,45 +358,80 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Sample personal moves:")
         for item_id, label in sample:
             item = id_to_item.get(item_id, {})
-            print(f"  {item_id}  {item.get('name', '')} -> {label}")
+            print(
+                f"  {shorten_id(item_id)}  {truncate_name(item.get('name', ''))} -> {label}"
+            )
 
-    sample_org = list(planned_org.items())[:10]
+    sample_org = list(planned_org_folders.items())[:10]
     if sample_org:
         print("Sample org moves:")
-        for item_id, (org_id, label) in sample_org:
+        for item_id, label in sample_org:
             item = id_to_item.get(item_id, {})
-            print(f"  {item_id}  {item.get('name', '')} (org {org_id}) -> {label}")
+            org_id = str(item.get("organizationId") or "")
+            print(
+                f"  {shorten_id(item_id)}  {truncate_name(item.get('name', ''))} (org {shorten_id(org_id)}) -> {label}"
+            )
 
     if args.dry_run and not args.apply:
         return 0
 
     # Apply
-    org_collection_maps: Dict[str, Dict[str, str]] = {}
-
-    # Ensure all needed folders/collections exist first
-    for label in set(planned_personal.values()):
-        ensure_folder(label, folder_name_to_id, session)
-
-    for item_id, (org_id, label) in planned_org.items():
-        ensure_org_collection(org_id, label, org_collection_maps, session)
-
+    total_personal = len(planned_personal)
+    total_org = len(planned_org_folders)
     failures: List[str] = []
 
-    for item_id, label in planned_personal.items():
+    created_folders: Set[str] = set()
+
+    progress(
+        f"[apply] start | personal={total_personal} | org={total_org} | item_delay={args.item_delay:.1f}s"
+    )
+
+    # Ensure all needed folders exist first
+    needed_labels = set(planned_personal.values()) | set(planned_org_folders.values())
+    for label in sorted(needed_labels):
+        folder_id, created = ensure_folder(label, folder_name_to_id, session)
+        if created and label not in created_folders:
+            created_folders.add(label)
+            progress(f"[create folder] {label} id={shorten_id(folder_id)}")
+
+    apply_personal_start = time.time()
+    for i, (item_id, label) in enumerate(planned_personal.items(), start=1):
+        item = id_to_item.get(item_id, {})
+        item_name = truncate_name(str(item.get("name") or ""))
         try:
-            folder_id = ensure_folder(label, folder_name_to_id, session)
+            folder_id, _ = ensure_folder(label, folder_name_to_id, session)
             bw_set_item_folder(item_id, folder_id, session=session)
+            progress(
+                f"[apply personal {i}/{total_personal}] ok id={shorten_id(item_id)} "
+                f"name={item_name} -> {label} | eta {estimate_eta(apply_personal_start, i, total_personal)}"
+            )
             time.sleep(args.item_delay)
         except Exception as e:
             failures.append(f"personal {item_id}: {e}")
+            progress(
+                f"[apply personal {i}/{total_personal}] FAIL id={shorten_id(item_id)} "
+                f"name={item_name} -> {label} | failures={len(failures)}"
+            )
 
-    for item_id, (org_id, label) in planned_org.items():
+    apply_org_start = time.time()
+    for i, (item_id, label) in enumerate(planned_org_folders.items(), start=1):
+        item = id_to_item.get(item_id, {})
+        item_name = truncate_name(str(item.get("name") or ""))
+        org_id = str(item.get("organizationId") or "")
         try:
-            cid = ensure_org_collection(org_id, label, org_collection_maps, session)
-            bw_set_item_collections_replace(item_id, org_id, [cid], session=session)
+            folder_id, _ = ensure_folder(label, folder_name_to_id, session)
+            bw_set_item_folder(item_id, folder_id, session=session)
+            progress(
+                f"[apply org {i}/{total_org}] ok id={shorten_id(item_id)} org={shorten_id(org_id)} "
+                f"name={item_name} -> {label} | eta {estimate_eta(apply_org_start, i, total_org)}"
+            )
             time.sleep(args.item_delay)
         except Exception as e:
             failures.append(f"org {item_id}: {e}")
+            progress(
+                f"[apply org {i}/{total_org}] FAIL id={shorten_id(item_id)} org={shorten_id(org_id)} "
+                f"name={item_name} -> {label} | failures={len(failures)}"
+            )
 
     if failures:
         print("Failures:")

@@ -33,13 +33,20 @@ except ImportError:  # pragma: no cover
 # LLM safety
 # -----------------------------------------------------------------------------
 
-FORBIDDEN_LLM_SUBSTRINGS = [
-    '"password"',
-    '"notes"',
-    '"totp"',
-    '"value"',  # custom field values
-    '"card"',
-    '"identity"',
+FORBIDDEN_LLM_KEYS = {
+    "password",
+    "notes",
+    "totp",
+    "value",  # custom field values
+    "card",
+    "identity",
+}
+
+FORBIDDEN_VALUE_SUBSTRINGS = [
+    # Value-level checks kept narrow to avoid false positives.
+    # These indicate a likely secret was accidentally included.
+    "begin private key",
+    "otp",
 ]
 
 
@@ -51,11 +58,42 @@ def mask_email_username(username: str) -> str:
     return f"***@{domain}"
 
 
+def _walk_json(obj: Any) -> List[Tuple[str, Any]]:
+    out: List[Tuple[str, Any]] = []
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            out.append((str(k), v))
+            out.extend(_walk_json(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            out.extend(_walk_json(v))
+    return out
+
+
 def assert_llm_payload_safe(payload: str) -> None:
+    """Fail-closed safety check.
+
+    This must avoid false positives in normal allowed metadata (e.g. an item name
+    that happens to include the word "password"). So we primarily block forbidden
+    JSON *keys*, not arbitrary substrings.
+    """
+
     lowered = payload.lower()
-    for marker in FORBIDDEN_LLM_SUBSTRINGS:
-        if marker in lowered:
-            raise ValueError(f"Refusing to send forbidden field to LLM: {marker}")
+    for needle in FORBIDDEN_VALUE_SUBSTRINGS:
+        if needle in lowered:
+            raise ValueError(f"Refusing to send suspicious value to LLM: {needle}")
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        parsed = None
+
+    if parsed is None:
+        return
+
+    for key, _ in _walk_json(parsed):
+        if key.lower() in FORBIDDEN_LLM_KEYS:
+            raise ValueError(f"Refusing to send forbidden key to LLM: {key}")
 
 
 def extract_custom_field_names(item: Mapping[str, Any]) -> List[str]:
@@ -65,6 +103,10 @@ def extract_custom_field_names(item: Mapping[str, Any]) -> List[str]:
             continue
         name = field.get("name")
         if isinstance(name, str) and name.strip():
+            # Defensive: don't leak sensitive custom fields by name.
+            lowered = name.strip().lower()
+            if any(k in lowered for k in FORBIDDEN_LLM_KEYS):
+                continue
             names.append(name.strip())
     return names
 
@@ -169,7 +211,10 @@ def bw_list_folders(*, session: Optional[str] = None) -> List[Mapping[str, Any]]
 
 
 def bw_create_folder(name: str, *, session: Optional[str] = None) -> Mapping[str, Any]:
-    created = bw_json(["create", "folder", name], session=session)
+    # `bw create folder` requires an encoded JSON payload on stdin/arg.
+    payload = {"name": name}
+    encoded = bw_encode_json(payload, session=session)
+    created = bw_json(["create", "folder", encoded], session=session)
     if not isinstance(created, Mapping):
         raise RuntimeError("Unexpected bw create folder output")
     return created
@@ -249,8 +294,20 @@ def bw_list_org_collections(
 def bw_create_org_collection(
     org_id: str, name: str, *, session: Optional[str] = None
 ) -> Mapping[str, Any]:
+    # Bitwarden CLI expects an org-collection template payload.
+    # Template shape (at minimum) includes organizationId, name, externalId,
+    # and permission arrays (groups/users).
+    payload = {
+        "organizationId": org_id,
+        "name": name,
+        "externalId": None,
+        "groups": [],
+        "users": [],
+    }
+    encoded = bw_encode_json(payload, session=session)
     created = bw_json(
-        ["create", "org-collection", name, "--organizationid", org_id], session=session
+        ["create", "org-collection", encoded, "--organizationid", org_id],
+        session=session,
     )
     if not isinstance(created, Mapping):
         raise RuntimeError("Unexpected bw create org-collection output")
@@ -614,6 +671,7 @@ def categorize_batch(
                 "category": company_result["category"],
                 "confidence": company_result["confidence"],
                 "reason": company_result["reason"],
+                "source": "domain_map",
             }
             continue
 
@@ -627,6 +685,7 @@ def categorize_batch(
                 "category": "Personal/Homelab",
                 "confidence": 100,
                 "reason": "Private IP",
+                "source": "homelab",
             }
             continue
 
@@ -637,6 +696,7 @@ def categorize_batch(
                 "category": "Dead",
                 "confidence": 100,
                 "reason": "URL unreachable",
+                "source": "dead",
             }
             continue
 
@@ -649,6 +709,7 @@ def categorize_batch(
                 "category": cached.get("category", ""),
                 "confidence": cached.get("confidence", 0),
                 "reason": cached.get("reason", ""),
+                "source": "domain_cache",
             }
             continue
 
@@ -691,6 +752,7 @@ def categorize_batch(
                 "category": result.get("category", ""),
                 "confidence": result.get("confidence", 0),
                 "reason": result.get("reason", ""),
+                "source": "llm",
             }
 
     ordered: List[Dict[str, Any]] = []
@@ -705,6 +767,7 @@ def categorize_batch(
                     "category": "",
                     "confidence": 0,
                     "reason": "Uncategorized",
+                    "source": "uncategorized",
                 },
             )
         )
