@@ -1,0 +1,11 @@
+[project]
+name = "organize-bitwarden-folders-ai"
+version = "0.1.0"
+description = "Organize Bitwarden folders/collections using bw CLI + LLM (never sends secrets)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.2.1",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+]
